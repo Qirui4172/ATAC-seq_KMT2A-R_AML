@@ -1,0 +1,43 @@
+ATAC-seq workflow
+
+Step 1. Remove duplicates
+	-Sort BAM
+	-Remove duplicates
+	-Index BAM
+
+Step 2. Filter BAM files
+	-Extract mapped reads and index BAM
+	-Remove chrM & other abnormal chromosomes
+	-Remove low-quality alignments (<Q30)
+	-Remove improper alignments (BAM flag 0x2)
+	-Remove single mates, sort and index BAM
+
+Step 3. Shift reads
+
+Step 4. Call peaks
+	-Call individual sample peaks
+	-Call genotype consensus peaks
+	-Call all-sample consensus peaks
+
+Step 5. Generate consensus peaks
+	-Remove blacklisted regions
+	-Merge genotype peaks
+	-Generate genotype consensus peaks
+	-Generate all-sample consensus peaks
+
+Step 6. Generate read counts
+
+Step 7. Generate BIGWIG
+
+Step 8. Annotate peaks
+
+Step 9. TSS plot
+	-Normalize BAM and compute TSS matrix
+	-Compute matrix and make plots
+
+Step 10. Find differential accessible regions (DARs)
+
+Step 11. Integrate with RNA-seq
+
+Step 12. Find DAR motifs
+
