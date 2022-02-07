@@ -1,0 +1,415 @@
+# Quality control
+# fastqc
+
+# Trim adapter
+# cutadapt
+
+#---------------------------------------------------------------------------------
+# Above steps are done, starts from here.
+# 1. Align to genome
+bowtie2-build mm10.fa mm10
+bowtie2 -X 2000 --very-sensitive -p 16 \
+-x /projects/fs1_no-backup/ls1-andersson/ANALYSIS/qirui/ref/mm10/mm10 \
+-1 /projects/fs1_no-backup/ls1-andersson/ANALYSIS/qirui/atac-seq/seq1/m16-25_S6_R1_001_val_1.fq.gz \
+-2 /projects/fs1_no-backup/ls1-andersson/ANALYSIS/qirui/atac-seq/seq1/m16-25_S6_R2_001_val_2.fq.gz -S m16-25_tech1.sam
+# "-1" and "-2" refer to forward read (read1) and reverse read (read2), respectively. normally filename contains "_1" or "_2", e.g. sample_1.fq, sample_2.fq. For single end sequencing, use "-U sample.fq".
+
+# 2. Transfer sam to bam, merge, sort
+# 2.1 Transfer sam to bam
+samtools view -@ 24 -Sb m16-25_tech1.sam > m16-25_tech1.bam
+  # The output sam file should be compressed to bam first
+
+# 2.2 Sort, index and merge bam files from two flow cells into one
+samtools sort -@ 24 -o alignment/m16-25_tech1.sort.bam alignment/m16-25_tech1.bam
+samtools sort -@ 24 -o alignment/m16-25_tech2.sort.bam alignment/m16-25_tech2.bam
+  # bam files should be sorted before creating index
+
+samtools index alignment/m16-25_tech1.sort.bam
+samtools index alignment/m16-25_tech2.sort.bam
+
+samtools merge -@ 24 alignment/m16-25_merge.bam alignment/m16-25_tech1.bam alignment/m16-25_tech2.bam
+# "m16-25_S6.bam" in seq1 and seq2 are technic replicates, same sample but sequenced twice, and should be merged.
+# extract columne 9 to obtain the fragment-length distribution.
+
+# 2.3 Sort by queryname/readname
+samtools sort -n -@ 24 -o m16-25_merge.sort.bam m16-25_merge.bam
+  # the bam file should be sorted by queryname (NOT by coordinate) before input to Genrich.
+
+# samtools index -@ 24 sample.bam (sample.bai)
+# if not mention "sample.bai", it automatically generate "sample.bam.bai". it doesn't work as expected when using ">": "samtools index sample.bam > sample.bai". If bam file is sorted by queryname/readname in the previous step, it can't be used for building index here, only bam files sorted by coordinate can be created index.
+
+samtools flagstat m16-25_merge.bam > m16-25_merge.stat
+
+bedtools bamtobed -i m16-25_merge.bam > m16-25_merge.bed
+# what's the purpose of this step, transferring bam to bed file?
+
+# Transfer bam to bigwig format
+# step1: convert bam to bedGraph
+bedtools genomecov -bg -i *.sort.bed -g hg19_size.txt > *.bedGraph
+
+# step2: convert bedGraph to bigwig
+bedGraphToBigWig *.bedGraph hg19_size.txt *.bw
+  # hg19.size is a tab dilimited chromosome size file:
+  # <chromosome><tab><chromosomesize>
+
+# Alternatively, use "deeptools bamCoverage"
+loaddeeptools
+bamCoverage -b m16-25.bam -o m16-25.bw -bs 1 -p 24 --ignoreDuplicates
+  # the bam file should be indexed. "-bs" is bin size (default 50), better use 1. "-p" is the thread number.
+
+bamCoverage -b m16-25.bam -o m16-25.bedg -bs 1 -p 24 -of bedgraph
+  # if output bedgraph format, use "-of" argument. the bam file should be indexed.
+
+#-------------------------------------------------------------------------
+# Filter uninformative reads
+# remove chrM reads
+samtools view -h *.bam |grep -v 'chrM' |samtools sort -O BAM -o *.rmChrM.bam
+# Alternatively, use "Genrich -e chrM" to remove reads aligned to mitochondrial chromosome.
+
+# remove duplicates
+java -jar $EBROOTPICARD/picard.jar MarkDuplicates REMOVE_DUPLICATES=true I=sample.bam O=sample.marked.bam M=sample.metrics
+  # by default the duplicates are only marked but not removed (REMOVE_DUPLICATES=false), set "true" to remove duplicates.
+samtools view -b -F 1024 sample.bam > sample.rmDup.bam
+  # "-F 1024" or "-F 0x0400"
+  # Not recommend use samtools to remove duplicate, picard performs better.
+# Genrich can also remove duplicate by using "-r" parameter. It also takes into account multimapped reads, which is not provided by Picard MarkDuplicates.
+
+# remove low-quality reads (MAPQ<30)
+samtools view -b -q 30 input.bam > output.bam
+# Genrich can also remove low-quality reads by using "-m 30" parameter.
+
+# Peak calling
+Genrich
+
+# Check fragment/insert size
+# First sort bam file by readName, then use the following script,
+samtools view sample.sortByname.bam |awk '{if($9!=0){print $0}}' |awk '{if(NR%2==1){if($9>0){print $9}else{print -$9}}}' |sort -n |uniq -c |awk '{print $2"\t"$1}' > sample.fragDistr
+
+#-------------------------------------------------------------------------
+Genrich -j -r -e chrM -m 30 -t m16-8.bam,m16-11.bam,m16-12.bam,m16-14.bam -o group1.narrowPk -b group1_intervals.bed -k group1_pileup.bedgish -f group1_log.bedgish
+
+# Genrich is not multithreaded, it runs on a single core only.
+# "-t" the input bam file should be sorted by queryname but NOT by coordinate, and should have header.
+# The biological replicates should be run together, to generate a sigle peak file. The technique replicates from a single biological replicate should be merged in advance via "samtools merge".
+# "-j" use ATAC-seq mode (MUST be specified; default false)
+# "-r" remove PCR duplicates
+# "-y" keep unpaired alignments (default false)
+# "-e" chromosomes of reference sequences to exclude
+# "-m" minimum MAPQ value to keep an alignment (default 0), this is equivalent to filtering with "samtools view -q 30"
+# "-b" output BED file for reads/fragments/intervals. This is an unsorted BED file of the reads/fragments/intervals analyzed. The 4th column gives the read name, number of valid alignments, 'E'xperimental or 'C'ontrol, and sample number (0-based), e.g. SRR5427886.59_2_E_0.
+# "-o" peak-calling result (ENCODE narrowPeak format)
+# "-f" generate log file in bedgraph-ish format, which can be used for call peaks directly. Log file lists experimental/control pileup values, p- and q-values, and significance (*) for each interval.
+# "-k" output bedgraph-ish format of pileups and p values, which is almost the same as log file except no significant marks. "bedgraph-ish" contains 6 fields, which isn't strictly allowed in the bedGraph format. but a simple application of awk can produce the desired bedgraph format files for visualization. THIS file is used for visualisation: remove header lines; extract the first 4 columns, save it to bedgraph format; use "bedGraphToBigWig.dms" to convert to bigwig format, which can be visualised in IGV directly.
+# "-d 100" expand cut sites to 100 bp (default: 100, 50 bp on each side), if only assess the coverage of the start sites of the reads, the data would be too sparse and it would be impossible to call peaks. Thus, it's needed to extend the start sites of the reads by 100bp (50 bp in each direction) to assess coverage.
+
+# Sort bed files
+# "bedtools sort" doesn't work so well, the better way is to use linux command to sort:
+sort -k1,1 -k2,2n sample.bed > sample.sort.bed
+  # sort by the chromosome, then sort by the coordinates.
+
+#-------------------------------------------------------------------------
+# Visualization
+Peak files can be loaded directly to IGV (File->load from File). The bam files should be sorted by coordinate and indexed. Using bam file can only show the alignments, but not the full fragments generated by ATAC nor the cut site intervals analyzed by Genrich. Using BED file can show the intervals.
+
+# Compare peak files
+use "bedtools intersect" to determine common regions of two peak files
+bedtools intersect -a A.bed -b B.bed -wa -wb
+
+use "bedtools subtract" to find difference between two peak files.
+
+# Motif finding
+HOMER for motif discovery
+
+# FRiP (fraction of reads in peaks)
+total_reads=$(samtools view -@ 24 -c m16-11_S2.bam)
+
+#-------------------------------------------------------------------------
+# Normalize bam/bigwig
+loaddeeptools
+bamCoverage --bam m16-8.bam -p 16 --normalizeUsingRPKM -bs 10 --outFileName m16-8.bs10.fpkm.bw
+    # Normalize clean bam file, and transfer to bigwig format, to visue in IGV.
+    # the bam file should be indexed.
+    
+# FPKM normalization
+for (i in 1:nrow(sample)){sample[i,4]=(sample[i,4]*1000000000)/((sample[i,3]-sample[i,2]+1)*colSums(as.data.frame(sample[,4])))}
+
+# FPKM normalize a readsCount.matrix with 33 columns (32 reads count + 1 exon length)
+rc1<-read.table("readsCount_raw.matrix",header=T)
+rc2<-rc1
+for (i in 1:nrow(rc1)){for (j in 1:32){rc2[i,j]=(rc1[i,j]*1000000000)/(rc1[i,33]*colSums(as.data.frame(rc1[,j])))}}
+write.table(rc2,"readsCount_FPKM.matrix",quote=F,row.names=T,col.names=T,sep="\t")
+
+#-------------------------------------------------------------------------
+# Annotate peak
+loadhomer
+cut -f1-6 m16-8.narrowPeak > m16-8.bed
+annotatePeaks.pl m16-8.bed mm10 > m16-8.annoPeak.tsv
+# "m16-8.bed" has 5 columns: peakID, chr, start, end, + (separated by tab)
+
+#-------------------------------------------------------------------------
+# Generate uniformed peaks in each group
+
+# transfer from narrowPeak format bedgraph format
+for file in `ls m16*narrowPeak`;do bedg=$(basename $file narrowPeak);bedg=${bedg}"bedg";cut -f1-3,8 $file > $bedg; done
+
+# merge biological replicates
+bedtools unionbedg -i m16-8.bedg m16-11.bedg m16-12.bedg m16-14.bedg > nras_g12d_raw.bedg
+
+cat nras_g12d_raw.bedg |awk '{sum=0;} $4!=0 {sum+=1;} $5!=0 {sum+=1;} $6!=0 {sum+=1;} $7!=0 {sum+=1;} sum>=3 {avg=($4+$5+$6+$7)/4;print $1"\t"$2"\t"$3"\t"avg;}' |sort -k1,1 -k2,2n > nras_g12d_uniformPeak1.bedg
+    # merge pvalue; keep peaks with >=3 overlaps between 4 replicates.
+
+cat nras_g12d_uniformPeak1.bedg |awk 'NR==1 {chr=$1;start=$2;end=$3;len=$3-$2+1;sum=$4*len;totalen=len;next;} $2==end {end=$3;len=$3-$2+1;sum+=($4*len);totalen+=len;next;} $2!=end {avg=sum/totalen;print chr"\t"start"\t"end"\t"avg;chr=$1;start=$2;end=$3;len=$3-$2+1;sum=$4*len;totalen=len;} END{avg=sum/totalen;print chr"\t"start"\t"end"\t"avg;}' > nras_g12d_uniformPeak2.bedg
+    # merge continous peaks
+
+cut -f1-3 nras_g12d_uniformPeak2.bedg > nras_g12d_uniformPeak2.bed
+
+#---------------------------------------------------------------------------------
+# Pairwise comparison
+bedtools intersect -a mll_kmt2a_uniformPeak2.bed -b flt3_itd_uniformPeak2.bed -wao |awk 'NR==1 {start=$2;sample=$1"\t"$2"\t"$3;if($7==0){sample=sample"\t0";print sample;flag=2;}else{sample=sample"\t"$4"_"$5"_"$6;flag=1;};next;} $2==start {sample=sample";"$4"_"$5"_"$6;flag=1;next;} $2!=start {if(flag==1){print sample};start=$2;sample=$1"\t"$2"\t"$3;if($7==0){sample=sample"\t0";print sample;flag=2;}else{sample=sample"\t"$4"_"$5"_"$6;flag=1;};next;} END {if(flag==1){print sample}}' > fi_vs_mk_raw.mx
+
+# Flt3_itd vs Mll-Kmt2a
+mkdir fi_vs_mk; cd fi_vs_mk
+bedtools intersect -a ../flt3_itd_uniformPeak2.bed -b ../mll_kmt2a_uniformPeak2.bed -wao > fi_vs_mk_raw.mx
+bedtools intersect -a ../mll_kmt2a_uniformPeak2.bed -b ../flt3_itd_uniformPeak2.bed -wao > mk_vs_fi_raw.mx
+grep '\.' mk_vs_fi_raw.mx |cut -f1-3|sort -k1,1 -k2,2n|uniq > fi_uniqPeak.bed
+grep '\.' fi_vs_mk_raw.mx |cut -f1-3|sort -k1,1 -k2,2n|uniq > mk_uniqPeak.bed
+grep -v '\.' fi_vs_mk_raw.mx |cut -f1-3|sort -k1,1 -k2,2n |uniq > mk_commonPeak.bed
+grep -v '\.' fi_vs_mk_raw.mx |cut -f4-6|sort -k1,1 -k2,2n |uniq > fi_commonPeak.bed
+
+# Flt3_n676k vs Mll-Kmt2a
+mkdir fn_vs_mk; cd fn_vs_mk 
+bedtools intersect -a ../flt3_n676k_uniformPeak2.bed -b ../mll_kmt2a_uniformPeak2.bed -wao > fn_vs_mk_raw.mx
+bedtools intersect -a ../mll_kmt2a_uniformPeak2.bed -b ../flt3_n676k_uniformPeak2.bed -wao > mk_vs_fn_raw.mx
+grep '\.' mk_vs_fn_raw.mx |cut -f1-3|sort -k1,1 -k2,2n|uniq > fn_uniqPeak.bed
+grep '\.' fn_vs_mk_raw.mx |cut -f1-3|sort -k1,1 -k2,2n|uniq > mk_uniqPeak.bed
+grep -v '\.' fn_vs_mk_raw.mx |cut -f1-3|sort -k1,1 -k2,2n |uniq > mk_commonPeak.bed
+grep -v '\.' fn_vs_mk_raw.mx |cut -f4-6|sort -k1,1 -k2,2n |uniq > fn_commonPeak.bed
+
+# Nras_g12d vs Mll-Kmt2a
+mkdir ng_vs_mk; cd ng_vs_mk
+bedtools intersect -a ../nras_g12d_uniformPeak2.bed -b ../mll_kmt2a_uniformPeak2.bed -wao > ng_vs_mk_raw.mx
+bedtools intersect -a ../mll_kmt2a_uniformPeak2.bed -b ../nras_g12d_uniformPeak2.bed -wao > mk_vs_ng_raw.mx
+grep '\.' mk_vs_ng_raw.mx |cut -f1-3|sort -k1,1 -k2,2n|uniq > ng_uniqPeak.bed
+grep '\.' ng_vs_mk_raw.mx |cut -f1-3|sort -k1,1 -k2,2n|uniq > mk_uniqPeak.bed
+grep -v '\.' ng_vs_mk_raw.mx |cut -f1-3|sort -k1,1 -k2,2n |uniq > mk_commonPeak.bed
+grep -v '\.' ng_vs_mk_raw.mx |cut -f4-6|sort -k1,1 -k2,2n |uniq > ng_commonPeak.bed
+
+#---------------------------------------------------------------------------------
+# Annotate peaks
+mkdir annoPeak; cd annoPeak
+
+# Flt3_itd vs Mll_kmt2a
+annotatePeaks.pl ../comparePeak/fi_vs_mk/fi_uniqPeak.bed mm10 > fi_vs_mk_uniqPeak_anno.tsv
+annotatePeaks.pl ../comparePeak/fi_vs_mk/fi_commonPeak.bed mm10 > fi_vs_mk_commonPeak_anno.tsv
+annotatePeaks.pl ../comparePeak/fi_vs_mk/mk_uniqPeak.bed mm10 > mk_vs_fi_uniqPeak_anno.tsv
+annotatePeaks.pl ../comparePeak/fi_vs_mk/mk_commonPeak.bed mm10 > mk_vs_fi_commonPeak_anno.tsv
+
+# Flt3_n676k vs Mll_kmt2a
+annotatePeaks.pl ../comparePeak/fn_vs_mk/fn_uniqPeak.bed mm10 > fn_vs_mk_uniqPeak_anno.tsv
+annotatePeaks.pl ../comparePeak/fn_vs_mk/fn_commonPeak.bed mm10 > fn_vs_mk_commonPeak_anno.tsv
+annotatePeaks.pl ../comparePeak/fn_vs_mk/mk_uniqPeak.bed mm10 > mk_vs_fn_uniqPeak_anno.tsv
+annotatePeaks.pl ../comparePeak/fn_vs_mk/mk_commonPeak.bed mm10 > mk_vs_fn_commonPeak_anno.tsv
+
+# Nras_g12d vs Mll-Kmt2a
+annotatePeaks.pl ../comparePeak/ng_vs_mk/ng_uniqPeak.bed mm10 > ng_vs_mk_uniqPeak_anno.tsv
+annotatePeaks.pl ../comparePeak/ng_vs_mk/ng_commonPeak.bed mm10 > ng_vs_mk_commonPeak_anno.tsv
+annotatePeaks.pl ../comparePeak/ng_vs_mk/mk_uniqPeak.bed mm10 > mk_vs_ng_uniqPeak_anno.tsv
+annotatePeaks.pl ../comparePeak/ng_vs_mk/mk_commonPeak.bed mm10 > mk_vs_ng_commonPeak_anno.tsv
+
+#---------------------------------------------------------------------------------
+# Find motifs
+cat ../../comparePeak/fi_vs_mk/fi_uniqPeak.bed |awk 'NR==1 {i=1;} {print "peak"i"\t"$1"\t"$2"\t"$3"\t+";i++;}' > fi_uniqPeak_homer.bed
+
+findMotifsGenome.pl fi_uniqPeak_homer.bed /projects/fs1_no-backup/ls1-andersson/ANALYSIS/qirui/ref/mm10/mm10.fa fi_uniq/
+
+
+#---------------------------------------------------------------------------------
+# Compare between 4 groups
+bedtools unionbedg -i flt3_itd_uniformPeak2.bedg flt3_n676k_uniformPeak2.bedg nras_g12d_uniformPeak2.bedg mll_kmt2a_uniformPeak2.bedg > all4group_peakUniform.bedg
+    # generate uniformed peak regions (split in small pieces) from 4 groups
+
+cat all4group_peakUniform.bedg |awk 'NR==1 {chr=$1;start=$2;end=$3;next} $2==end {end=$3;next;} $2!=end {print chr"\t"start"\t"end;chr=$1;start=$2;end=$3;} END{print chr"\t"start"\t"end;}'> all4group_peakUniform.bed
+    # merge continous small regions into peaks (in bed format)
+
+bedtools intersect -a all4group_peakUniform.bed -b flt3_itd_uniformPeak2.bed -wao > flt3_itd_comp_raw1.mx
+
+cat flt3_itd_comp_raw1.mx |awk 'NR==1 {start=$2;sample=$1"\t"$2"\t"$3;if($7==0){sample=sample"\t0";print sample;flag=2;}else{sample=sample"\t"$4"_"$5"_"$6;flag=1;};next;} $2==start {sample=sample";"$4"_"$5"_"$6;flag=1;next;} $2!=start {if(flag==1){print sample};start=$2;sample=$1"\t"$2"\t"$3;if($7==0){sample=sample"\t0";print sample;flag=2;}else{sample=sample"\t"$4"_"$5"_"$6;flag=1;};next;} END {if(flag==1){print sample}}' > flt3_itd_comp_raw2.mx
+
+# Generate peak comparison matrix
+paste flt3_itd_comp_raw2.mx flt3_n676k_comp_raw2.mx nras_g12d_comp_raw2.mx mll_kmt2a_comp_raw2.mx |cut -f1-4,8,12,16 > peak_compare_raw.mx
+
+cat peak_compare_raw.mx | awk '$4==0 && $5!=0 && $6!=0 && $7!=0 {print $0"\tfnngmk"} $4!=0 && $5==0 && $6!=0 && $7!=0 {print $0"\tfingmk"} $4!=0 && $5!=0 && $6==0 && $7!=0 {print $0"\tfifnmk"} $4!=0 && $5!=0 && $6!=0 && $7==0 {print $0"\tfifnng"} $4==0 && $5==0 && $6!=0 && $7!=0 {print $0"\tngmk"} $4==0 && $5!=0 && $6==0 && $7!=0 {print $0"\tfnmk"} $4==0 && $5!=0 && $6!=0 && $7==0 {print $0"\tfnng"} $4!=0 && $5==0 && $6==0 && $7!=0 {print $0"\tfimk"} $4!=0 && $5==0 && $6!=0 && $7==0 {print $0"\tfing"} $4!=0 && $5!=0 && $6==0 && $7==0 {print $0"\tfifn"} $4==0 && $5==0 && $6==0 && $7!=0 {print $0"\tmk"} $4==0 && $5==0 && $6!=0 && $7==0 {print $0"\tng"} $4==0 && $5!=0 && $6==0 && $7==0 {print $0"\tfn"} $4!=0 && $5==0 && $6==0 && $7==0 {print $0"\tfi"} $4!=0 && $5!=0 && $6!=0 && $7!=0 {print $0"\tfifnngmk"}' > peak_compare_grouped.mx
+
+# Obtain flt3_itd uniq peaks
+cat peak_compare_grouped.mx | awk '$8=="fi" {print $4}' |sed 's/_/\t/g' > flt3_itd_uniqPeak.bed
+cat flt3_itd_uniqPeak.bed | awk '{print $0"\t2020"}' > tmp
+bedtools intersect -a flt3_itd_uniformPeak2.bedg -b tmp -loj |awk '$5~/chr/ {print $1"\t"$2"\t"$3"\t"$4}' > flt3_itd_uniqPeak.bedg
+rm tmp
+
+cat peak_compare_grouped.mx | awk '$8=="fn" {print $5}' |sed 's/_/\t/g' > flt3_n676k_uniqPeak.bed
+cat peak_compare_grouped.mx | awk '$8=="ng" {print $6}' |sed 's/_/\t/g' > nras_g12d_uniqPeak.bed
+cat peak_compare_grouped.mx | awk '$8=="mk" {print $7}' |sed 's/_/\t/g' > mll_kmt2a_uniqPeak.bed
+
+# Obtain common peaks from each group
+# Common peaks in theory should be same between groups, but it could be tiny differet in size, like 2 small peaks in one group overlap with 1 large peak in another group.
+cat peak_compare_grouped.mx | awk '$8=="fifnngmk" {print $4}' |sed 's/_/\t/g' |sed 's/;/\n/g' > flt3_itd_commonPeak.bed
+cat flt3_itd_commonPeak.bed |awk '{print $0"\t2020"}'>tmp
+bedtools intersect -a flt3_itd_uniformPeak2.bedg -b tmp -loj | awk '$5~/chr/ {print $1"\t"$2"\t"$3"\t"$4}' > flt3_itd_commonPeak.bedg
+rm tmp
+
+cat peak_compare_grouped.mx | awk '$8=="fifnngmk" {print $5}' |sed 's/_/\t/g' |sed 's/;/\n/g' > flt3_n676k_commonPeak.bed
+cat peak_compare_grouped.mx | awk '$8=="fifnngmk" {print $6}' |sed 's/_/\t/g' |sed 's/;/\n/g' > nras_g12d_commonPeak.bed
+cat peak_compare_grouped.mx | awk '$8=="fifnngmk" {print $7}' |sed 's/_/\t/g' |sed 's/;/\n/g' > mll_kmt2a_commonPeak.bed
+
+# Annotate peaks
+annotatePeaks.pl flt3_itd_uniqPeak.bed mm10 > flt3_itd_uniqPeak_anno.tsv
+
+#--------------------------------------------------------------------------------
+# FPKM normalization in R
+colSums(as.data.frame(rc1[,1]))
+>27777388
+for (i in 1:nrow(rc1)){rc2[i,1]=rc1[i,1]/(rc1[i,17]*0.027777388)}
+
+colSums(as.data.frame(rc1[,2]))
+>9386317
+for (i in 1:nrow(rc1)){rc2[i,2]=rc1[i,2]/(rc1[i,17]*0.009386317)}
+
+colSums(as.data.frame(rc1[,3]))
+>56718434
+for (i in 1:nrow(rc1)){rc2[i,3]=rc1[i,3]/(rc1[i,17]*0.056718434)}
+
+colSums(as.data.frame(rc1[,4]))
+>53542091
+for (i in 1:nrow(rc1)){rc2[i,4]=rc1[i,4]/(rc1[i,17]*0.053542091)}
+
+colSums(as.data.frame(rc1[,5]))
+>60068123
+for (i in 1:nrow(rc1)){rc2[i,5]=rc1[i,5]/(rc1[i,17]*0.060068123)}
+
+colSums(as.data.frame(rc1[,6]))
+>50773147
+for (i in 1:nrow(rc1)){rc2[i,6]=rc1[i,6]/(rc1[i,17]*0.050773147)}
+
+colSums(as.data.frame(rc1[,7]))
+>44019334
+for (i in 1:nrow(rc1)){rc2[i,7]=rc1[i,7]/(rc1[i,17]*0.044019334)}
+
+colSums(as.data.frame(rc1[,8]))
+>40920492
+for (i in 1:nrow(rc1)){rc2[i,8]=rc1[i,8]/(rc1[i,17]*0.040920492)}
+
+colSums(as.data.frame(rc1[,9]))
+>34903529
+for (i in 1:nrow(rc1)){rc2[i,9]=rc1[i,9]/(rc1[i,17]*0.034903529)}
+
+colSums(as.data.frame(rc1[,10]))
+>21892957
+for (i in 1:nrow(rc1)){rc2[i,10]=rc1[i,10]/(rc1[i,17]*0.021892957)}
+
+colSums(as.data.frame(rc1[,11]))
+>35814761
+for (i in 1:nrow(rc1)){rc2[i,11]=rc1[i,11]/(rc1[i,17]*0.035814761)}
+
+colSums(as.data.frame(rc1[,12]))
+>32401434
+for (i in 1:nrow(rc1)){rc2[i,12]=rc1[i,12]/(rc1[i,17]*0.032401434)}
+
+colSums(as.data.frame(rc1[,13]))
+>63109391
+for (i in 1:nrow(rc1)){rc2[i,13]=rc1[i,13]/(rc1[i,17]*0.063109391)}
+
+colSums(as.data.frame(rc1[,14]))}
+>48977611
+for (i in 1:nrow(rc1)){rc2[i,14]=rc1[i,14]/(rc1[i,17]*0.048977611)}
+
+colSums(as.data.frame(rc1[,15]))
+>69794777
+for (i in 1:nrow(rc1)){rc2[i,15]=rc1[i,15]/(rc1[i,17]*0.069794777)}
+
+colSums(as.data.frame(rc1[,16]))
+>44752114
+for (i in 1:nrow(rc1)){rc2[i,16]=rc1[i,16]/(rc1[i,17]*0.044752114)}
+
+write.table(rc2[,1:16],"all16sample_readcount_fpkm.mx",quote=F,sep="\t",col.names=T,row.names=T)
+#-------------------------------------------------------------------------
+fpkm2=fpkm
+for (i in 1:ncol(fpkm2)){fpkm2[which(fpkm2[,i]<5),i]=0}
+for (i in 1:ncol(fpkm2)){fpkm2[which(fpkm2[,i]>=5),i]=1}
+
+fi<-read.table("fi_km_fpkm01_nonzero.mx",header=T)
+tmp=fi
+tmp$pvalue=0
+for(i in 1:nrow(tmp)){a=length(which(tmp[i,1:4]==0));c=length(which(tmp[i,1:4]!=0));b=length(which(tmp[i,5:8]==0));d=length(which(tmp[i,5:8]!=0));p=(factorial(a+b)*factorial(c+d)*factorial(a+c)*factorial(b+d))/(factorial(a)*factorial(b)*factorial(c)*factorial(d)*factorial(a+b+c+d));tmp[i,9]=p}
+write.table(tmp,"fi_km_fisherTest.mx",col.names=T,row.names=T,quote=F,sep="\t")
+
+cat fi_km_fisherTest.mx | awk '$10<0.1 {if($2+$3+$4+$5>$6+$7+$8+$9){print $0}}' |cut -f1|sed 's/_/\t/g' > fi_specificPeak.bed
+cat fi_km_fisherTest.mx | awk '$10<0.1 {if($2+$3+$4+$5<=$6+$7+$8+$9){print $0}}' |cut -f1|sed 's/_/\t/g' > km_fi_specificPeak.bed
+cat fi_km_fisherTest.mx | awk '$10>0.1 {print $0}'|cut -f1 |sed 's/_/\t/g' > fi_km_commonPeak.bed
+
+#----------------------------------------------------------------------------
+# MACS2
+macs2 callpeak -t ../alignment/cleanBam/m16-8.bam -n m16-8 -g mm -f BAMPE -B --outdir m16-8/ 2>m16-8.log
+
+# input bam is sorted by coordinates. "-t" is the only required parameter, multiple samples can be used simutaneously to call peaks, "-t rep1.bam rep2.bam rep3.bam". bam files should be sorted by coordinates and indexed. MACS will pool up all these files together and generate one consensus peak set of these samples/replicates.
+# "-n" is the prefix of output; "-g" refers to genome size, or only specify the abbreviation of genome name, "mm" for mouse, "hs" for human; "-f" means the input format is bam paired end.
+# "--nomodel --shift -10 --extsize 200" is used for finding the "cutting sites".
+# "--keep-dup=1 (default)" means to keep maximum 1 duplicate, "--keep-dup=all" keep all duplicates, that is not removing duplicates.
+# "-B/--bdg" to generate fragment pileup in bedgraph format.
+# in general, use "--format BAMPE" if focusing on the accessible regions between Tn5 insertion sites of a read pair, to let MACS2 pileup the whole fragments; and use "--nomodel --shift -100 --extsize 200" if focusing on finding the "cutting sites".
+# The output peaks.narrowPeak is in BED6+4 format, having 10 columns: chr, chrStart, chrEnd, peakID, integer score for display, strand, fold_change at peak summit, -log10pvalue at peak summit, -log10qvalue at peak summit, relative summit position to peak start.
+# The 5th column of peaks.narrowPeak is the integer score of either int(-10*log10pvalue) or int(-10*log10qvalue) depending on whether -p (pvalue) or -q (qvalue) is used as score cutoff, and it may be out of the [0-1000] range defined in UCSC ENCODE narrowPeak format. The values can be saturated at 1000 by 1-line command: awk -v OFS="\t" '{$5=$5>1000?1000:$5} {print}' peaks.narrowPeak
+# "-q 0.05" is the adjusted p-value or FDR for calling peaks (default 0.05).
+
+#-------------------------------------------------------------------------
+# Generate consensus peak set manually
+# generate bedgraph
+for file in `ls m16-*/m16-*narrowPeak`;do sample=$(dirname $file);awk '{print $1"\t"$2"\t"$3"\t1"}' $file > ${sample}_forMerge.bedg;done
+
+# merge all peaks to generate a consensus peak set
+bedtools unionbedg -i m16-8_forMerge.bedg m16-11_forMerge.bedg m16-12_forMerge.bedg m16-14_forMerge.bedg m16-15_forMerge.bedg m16-16_forMerge.bedg m16-17_forMerge.bedg m16-19_forMerge.bedg m16-23_forMerge.bedg m16-25_forMerge.bedg m16-26_forMerge.bedg m16-27_forMerge.bedg m16-30_forMerge.bedg m16-31_forMerge.bedg m16-33_forMerge.bedg m16-35_forMerge.bedg > consensusPeaks_raw.mx
+
+# filter out some peaks with less overlap
+perl mergePeakOverlaps.pl consensusPeaks_raw.mx 6 3 consensusPeaks.tmp1
+bedtools merge -i consensusPeaks.tmp1 -d 150 > consensusPeaks.tmp2
+  # merge peaks within 150bp intervals
+cat consensusPeaks.tmp2 |awk 'BEGIN {OFS="\t"; i=1;} {print $1,$2,$3,"peak_"i; i+=1;}' > consensusPeaks.bed
+rm consensusPeaks.tmp1 consensusPeaks.tmp2
+
+#-------------------------------------------------------------------------
+# Shift reads
+# the BAM file should be sorted by read name beforehand
+samtools sort -@ 16 -n -o sample.sortbyname.bam sample.bam
+
+#The bedtools command should extract the paired-end alignments as bedpe format, then the awk command should shift the fragments as needed
+bedtools bamtobed -bedpe -i sample.sortbyname.bam > sample.bedpe
+cat sample.bedpe | awk '$9=="+" {print $1"\t"$2+4"\t"$6+4} $9=="-" {print $1"\t"$2-5"\t"$6-5}' > sample.bed
+
+#-------------------------------------------------------------------------
+# Library complexity: NRF, PBC1, PBC2
+PCR Bottlenecking Coefficient 1 (PBC1)
+PBC1=M1/M_distinct
+M1: number of genomic locations where exactly one read maps uniquely
+M_distinct: number of distinct genomic locations to which some read maps uniquely
+
+PBC2=M1/M2
+M1: number of genomic locations where only one read maps uniquely
+M2: number of genomic locations where two reads map uniquely
+
+Non-Redundant Fraction (NRF): number of distinct uniquely mapping reads (i.e. after removing duplicates)/total number of reads
+
+#----------------------------------------------------------------------------
+Fraction of reads in called peak regions (FRiP)
+
+# total reads
+total_reads=$(samtools view -c ${sample}.bam)
+
+# reads in peaks
+reads_in_peaks=$(bedtools sort -i ${sample}_peaks.narrowPeak | bedtools merge -i stdin | bedtools intersect -u -nonamecheck -a ${sample}.bam -b stdin -ubam | samtools view -c)
+
+# FRiP score
+FRiP=$(awk "BEGIN {print "${reads_in_peaks}"/"${total_reads}"}")
+
+
+
+
+
